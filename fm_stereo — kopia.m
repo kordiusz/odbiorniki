@@ -1,83 +1,76 @@
-%% --- PlutoSDR FM Stereo Receiver (wersja lekka i płynna) ---
-% Autor: ChatGPT (GPT-5)
-% Opis: uproszczony, wydajny odbiornik FM stereo działający płynnie z PlutoSDR
+%% PlutoSDR FM Radio Receiver (Stereo, FIR1 light)
+% Frequency: 101.6 MHz
 
-%% --- Ustawienia SDR ---
-FmCenter = 101.6e6;          % częstotliwość stacji FM
-SampleRate = 1e6;            % niższe Fs = mniejsze obciążenie CPU
-SamplesPerFrame = 80000;
-
+% Initialize PlutoSDR receiver
 rx = sdrrx('Pluto', ...
-    'CenterFrequency', FmCenter, ...
-    'BasebandSampleRate', SampleRate, ...
-    'SamplesPerFrame', SamplesPerFrame, ...
+    'CenterFrequency', 101.6e6, ...
+    'BasebandSampleRate', 1e6, ...
+    'SamplesPerFrame', 400000, ...
     'GainSource', 'AGC Slow Attack');
 
-%% --- Etap 1: filtr kanału FM (~200 kHz) ---
-fmChannelFilter = designfilt('lowpassfir', ...
-    'PassbandFrequency', 100e3, 'StopbandFrequency', 120e3, ...
-    'PassbandRipple', 0.5, 'StopbandAttenuation', 60, ...
-    'SampleRate', SampleRate);
+% Audio configuration
+audioFs = 48000; % Hz
+audioPlayer = audioDeviceWriter('SampleRate', audioFs);
 
-%% --- Etap 2: dwustopniowa decymacja (manualna) ---
-Decim1 = 4;      % pierwszy stopień (1 MHz → 250 kHz)
-Decim2 = 5;      % drugi stopień (250 → 50 kHz)
-Fs1 = SampleRate / Decim1;
-Fs_Audio = Fs1 / Decim2;
+% --- Filters (FIR1, niskiego rzędu) ---
+fmChannelFilter = fir1(31, 120e3/(1e6/2));  % LPF ~120 kHz dla kanału FM
+monoLPF       = fir1(31, 15e3/(1e6/2));     % LPF L+R 0-15 kHz
+pilotBPF      = fir1(31, [18.8e3 19.2e3]/(1e6/2)); % BPF pilot 19 kHz
+stereoBPF     = fir1(31, [23e3 53e3]/(1e6/2));     % BPF L-R 23-53 kHz
 
-% Lekki filtr antyaliasingowy przed pierwszą decymacją
-h1 = fir1(41, 0.18);   % 41-tap lowpass (~90 kHz przy 1 MHz)
+% Decimation factor to bring to ~100 kHz range
+audioDecimation = 10;
+Fs_dec = 1e6 / audioDecimation;
 
-% Lekki filtr antyaliasingowy przed drugą decymacją
-h2 = fir1(31, 0.16);   % 31-tap lowpass (~20 kHz przy 250 kHz)
+% LPF for audio after demodulation
+audioLPF = fir1(31, 15e3/(Fs_dec/2));
 
-disp(['Fs1 = ', num2str(Fs1/1e3), ' kHz,  Fs_Audio = ', num2str(Fs_Audio/1e3), ' kHz']);
+disp('Receiving FM stereo from 101.6 MHz... Press Ctrl+C to stop.');
 
-%% --- Filtry kanałów stereo (na Fs1 = 250 kHz) ---
-sumFilter = designfilt('lowpassfir', ...
-    'PassbandFrequency', 15e3, 'StopbandFrequency', 17e3, ...
-    'PassbandRipple', 0.5, 'StopbandAttenuation', 60, ...
-    'SampleRate', Fs1);
-
-diffFilter = designfilt('bandpassfir', ...
-    'FilterOrder', 80, 'CutoffFrequency1', 23e3, 'CutoffFrequency2', 53e3, ...
-    'SampleRate', Fs1);
-
-%% --- Odtwarzacz audio ---
-audioPlayer = audioDeviceWriter('SampleRate', Fs_Audio, 'BufferSize', 8192);
-
-disp(['Odbiór FM stereo ', num2str(FmCenter/1e6), ' MHz (płynny tryb). Ctrl+C = stop.']);
-
-%% --- Pętla główna ---
+%% Main loop
 while true
-    rxData = double(rx());                        % odbiór próbek z PlutoSDR
+    % Receive samples
+    rxData = double(rx());
 
-    % 1️⃣ FM kanał – ogranicz pasmo
-    rxData = filter(fmChannelFilter, rxData);
+    % Band-limit FM channel
+    rxData = filter(fmChannelFilter,1, rxData);
 
-    % 2️⃣ FM demodulacja (szybka wersja bez angle)
-    fmDemod = imag(conj(rxData(1:end-1)) .* rxData(2:end));
+    % FM demodulation (phase difference method)
+    fmDemod = angle(conj(rxData(1:end-1)) .* rxData(2:end));
 
-    % 3️⃣ Pierwsza decymacja (1 MHz → 250 kHz)
-    x1 = filter(h1, 1, fmDemod);
-    x1 = x1(1:Decim1:end);
+    % Filtered mono component (L+R)
+    LplusR = filter(monoLPF, 1,fmDemod);
 
-    % 4️⃣ Stereo dekodowanie (na Fs1 = 250 kHz)
-    t = (0:length(x1)-1)' / Fs1;
-    pilot38 = cos(2*pi*38e3*t);
+    % Extract pilot (19 kHz)
+    pilot = filter(pilotBPF, 1, fmDemod);
 
-    sumSig = filter(sumFilter, x1);
-    diffSig = filter(diffFilter, x1 .* pilot38);
+    % Generate 38 kHz subcarrier by squaring pilot
+    pilotNorm = pilot / max(abs(pilot) + eps);
+    subcarrier = sign(pilotNorm);  % prosty 38 kHz w fazie z pilotem
 
-    L = sumSig + diffSig;
-    R = sumSig - diffSig;
+    % Extract (L-R) band around 38 kHz
+    LminusR_band = filter(stereoBPF, 1,fmDemod);
 
-    % 5️⃣ Druga decymacja (250 → 50 kHz)
-    Ld = filter(h2, 1, L);
-    Rd = filter(h2, 1, R);
-    Ld = Ld(1:Decim2:end);
-    Rd = Rd(1:Decim2:end);
+    % Multiply with regenerated 38 kHz subcarrier to demodulate
+    LminusR = LminusR_band .* subcarrier;
 
-    % 6️⃣ Odtwarzanie audio
-    audioPlayer([Ld, Rd] * 2.5);
+    % Decimate and low-pass both signals
+    LplusR_dec = LplusR(1:audioDecimation:end);
+    LminusR_dec = LminusR(1:audioDecimation:end);
+
+    % LPF after demodulation
+    LplusR_filt = filter(audioLPF, 1,LplusR_dec);
+    LminusR_filt = filter(audioLPF, 1, LminusR_dec);
+
+    % Combine to left and right channels
+    L = (LplusR_filt + LminusR_filt) / 2;
+    R = (LplusR_filt - LminusR_filt) / 2;
+
+    % Resample to audio rate
+    L_audio = resample(L, audioFs, Fs_dec);
+    R_audio = resample(R, audioFs, Fs_dec);
+
+    % Combine and play
+    stereoOut = [L_audio, R_audio];
+    audioPlayer(stereoOut);
 end
